@@ -1,105 +1,113 @@
 """
 Sentinel-2 data handling and processing.
 
-This module provides functionality for loading and processing Sentinel-2 data,
-including surface reflectance extraction, metadata parsing, and geometric
-information retrieval.
+This module provides functionality for loading Sentinel-2 L2A surface reflectance
+data, extracting observation geometry from metadata, and preparing data for
+albedo computation.
 
 Original R implementation by Andre Bertoncini
 Python port by Claude AI Assistant
 """
 
 import logging
-import xml.etree.ElementTree as ET
+from typing import Dict, Tuple, Optional, List
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+import xml.etree.ElementTree as ET
 
 import numpy as np
-import rasterio
 import xarray as xr
+import rasterio
+from rasterio.warp import reproject, Resampling
 from rasterio.crs import CRS
-from rasterio.warp import transform_bounds
-from scipy import interpolate
+import geopandas as gpd
+from shapely.geometry import box
 
 
 class Sentinel2DataHandler:
     """
-    Handler for Sentinel-2 data loading and processing.
+    Handler for Sentinel-2 L2A surface reflectance data.
     
-    This class provides methods to load Sentinel-2 L2A surface reflectance data,
-    extract observation geometry from metadata, and process spectral bands.
-    
-    Parameters
-    ----------
-    data_path : Path, optional
-        Base path to Sentinel-2 data directories
+    This class provides methods to load Sentinel-2 data, extract geometry
+    information from metadata XML files, and prepare data for albedo processing.
     """
     
     def __init__(self, data_path: Optional[Path] = None):
         self.data_path = Path(data_path) if data_path else None
         self.logger = logging.getLogger(__name__)
         
-        # Sentinel-2 band mapping (L2A)
+        # Sentinel-2 band mapping (L2A products)
         self.band_mapping = {
-            'B02': {'name': 'Blue', 'resolution': 10},
-            'B03': {'name': 'Green', 'resolution': 10},
-            'B04': {'name': 'Red', 'resolution': 10},
-            'B08': {'name': 'NIR', 'resolution': 10},
-            'B05': {'name': 'VegRE1', 'resolution': 20},
-            'B06': {'name': 'VegRE2', 'resolution': 20},
-            'B07': {'name': 'VegRE3', 'resolution': 20},
-            'B8A': {'name': 'NIR_narrow', 'resolution': 20},
-            'B11': {'name': 'SWIR1', 'resolution': 20},
-            'B12': {'name': 'SWIR2', 'resolution': 20},
+            'B02': 'blue',      # 490 nm - 10m
+            'B03': 'green',     # 560 nm - 10m  
+            'B04': 'red',       # 665 nm - 10m
+            'B08': 'nir',       # 842 nm - 10m
+            'B11': 'swir1',     # 1610 nm - 20m
+            'B12': 'swir2',     # 2190 nm - 20m
         }
         
-        # Default bands for albedo processing
-        self.albedo_bands = ['B02', 'B03', 'B04', 'B08', 'B11', 'B12']
+        # Target resolution for processing
+        self.target_resolution = 20  # meters
+        self.target_crs = CRS.from_epsg(32611)  # UTM Zone 11N (default)
     
-    def find_product_directory(self, target_date: datetime, tile_id: Optional[str] = None) -> Optional[Path]:
+    def find_product_folder(self, target_date: datetime) -> Optional[Path]:
         """
-        Find Sentinel-2 product directory for given date.
+        Find Sentinel-2 product folder for target date.
         
         Parameters
         ----------
         target_date : datetime
             Target acquisition date
-        tile_id : str, optional
-            Specific tile identifier (e.g., 'T11UMT')
             
         Returns
         -------
         Path or None
-            Path to product directory if found
+            Path to product folder if found
         """
-        if self.data_path is None:
-            raise ValueError("Data path not set")
+        if not self.data_path or not self.data_path.exists():
+            raise ValueError("Sentinel-2 data path not set or does not exist")
         
-        date_str = target_date.strftime('%Y%m%d')
+        date_str = target_date.strftime("%Y%m%d")
         
-        # Search for matching directories
-        pattern = f"*{date_str}*"
-        if tile_id:
-            pattern = f"*{tile_id}*{date_str}*"
+        # Search for folders containing the target date
+        for folder in self.data_path.iterdir():
+            if folder.is_dir() and date_str in folder.name:
+                # Check if it's a valid Sentinel-2 folder
+                if self._is_valid_s2_folder(folder):
+                    return folder
         
-        matching_dirs = list(self.data_path.glob(pattern))
+        self.logger.warning(f"No Sentinel-2 product found for {date_str}")
+        return None
+    
+    def _is_valid_s2_folder(self, folder: Path) -> bool:
+        """
+        Check if folder is a valid Sentinel-2 product folder.
         
-        if not matching_dirs:
-            self.logger.warning(f"No Sentinel-2 products found for {date_str}")
-            return None
+        Parameters
+        ----------
+        folder : Path
+            Folder to check
+            
+        Returns
+        -------
+        bool
+            True if valid Sentinel-2 folder
+        """
+        # Look for MTD_TL.xml file
+        mtd_file = folder / "MTD_TL.xml"
+        if not mtd_file.exists():
+            # Try alternative structure
+            granule_folders = list(folder.glob("GRANULE/*/"))
+            if granule_folders:
+                mtd_file = granule_folders[0] / "MTD_TL.xml"
         
-        if len(matching_dirs) > 1:
-            self.logger.warning(f"Multiple products found for {date_str}, using first: {matching_dirs[0]}")
-        
-        return matching_dirs[0]
+        return mtd_file.exists()
     
     def load_surface_reflectance(
         self, 
-        target_date: datetime, 
+        target_date: datetime,
         extent: Tuple[float, float, float, float],
-        bands: Optional[List[str]] = None,
-        resolution: int = 20
+        bands: Optional[List[str]] = None
     ) -> xr.Dataset:
         """
         Load Sentinel-2 surface reflectance data.
@@ -109,105 +117,98 @@ class Sentinel2DataHandler:
         target_date : datetime
             Target acquisition date
         extent : tuple
-            Spatial extent as (xmin, xmax, ymin, ymax)
+            Bounding box as (xmin, xmax, ymin, ymax)
         bands : list, optional
-            List of bands to load (default: albedo_bands)
-        resolution : int, optional
-            Target resolution in meters (default: 20)
+            List of bands to load (default: all bands)
             
         Returns
         -------
         xr.Dataset
-            Dataset containing surface reflectance bands
+            Sentinel-2 surface reflectance dataset
         """
-        if bands is None:
-            bands = self.albedo_bands
+        self.logger.info(f"Loading Sentinel-2 data for {target_date.strftime('%Y-%m-%d')}")
         
-        # Find product directory
-        product_dir = self.find_product_directory(target_date)
-        if product_dir is None:
+        # Find product folder
+        product_folder = self.find_product_folder(target_date)
+        if not product_folder:
             raise FileNotFoundError(f"No Sentinel-2 product found for {target_date}")
         
-        self.logger.info(f"Loading Sentinel-2 data from {product_dir}")
+        # Default bands if not specified
+        if bands is None:
+            bands = list(self.band_mapping.keys())
         
-        # Load bands
-        data_vars = {}
+        # Load each band
+        band_arrays = {}
         
         for band in bands:
-            band_path = self._find_band_file(product_dir, band, resolution)
-            if band_path:
-                band_data = self._load_band(band_path, extent)
-                data_vars[band] = band_data
+            band_file = self._find_band_file(product_folder, band)
+            if band_file:
+                band_array = self._load_band(band_file, extent)
+                band_name = self.band_mapping.get(band, band)
+                band_arrays[band_name] = band_array
             else:
-                self.logger.warning(f"Band {band} not found in product")
+                self.logger.warning(f"Band {band} file not found")
         
         # Create dataset
-        dataset = xr.Dataset(data_vars)
+        dataset = xr.Dataset(band_arrays)
         
         # Add metadata
-        dataset.attrs['product_dir'] = str(product_dir)
-        dataset.attrs['target_date'] = target_date.isoformat()
+        dataset.attrs['product_folder'] = str(product_folder)
+        dataset.attrs['acquisition_date'] = target_date.isoformat()
         dataset.attrs['extent'] = extent
         
+        self.logger.info(f"Loaded {len(band_arrays)} bands")
         return dataset
     
-    def _find_band_file(self, product_dir: Path, band: str, resolution: int) -> Optional[Path]:
+    def _find_band_file(self, product_folder: Path, band: str) -> Optional[Path]:
         """
-        Find band file in product directory.
+        Find the file for a specific band.
         
         Parameters
         ----------
-        product_dir : Path
-            Product directory path
+        product_folder : Path
+            Sentinel-2 product folder
         band : str
             Band identifier (e.g., 'B04')
-        resolution : int
-            Target resolution
             
         Returns
         -------
         Path or None
             Path to band file if found
         """
-        # Look in IMG_DATA subdirectories
-        img_data_dir = product_dir / "GRANULE" / "*" / "IMG_DATA"
+        # Look for band files in IMG_DATA folder
+        img_data_folders = list(product_folder.glob("**/IMG_DATA/**"))
         
-        # Search for band file with specific resolution
-        pattern = f"*{band}_{resolution}m.jp2"
-        
-        for img_dir in product_dir.glob("GRANULE/*/IMG_DATA"):
-            # Try resolution-specific subdirectory first
-            res_dir = img_dir / f"R{resolution}m"
-            if res_dir.exists():
-                band_files = list(res_dir.glob(pattern))
-                if band_files:
-                    return band_files[0]
-            
-            # Try main IMG_DATA directory
-            band_files = list(img_dir.glob(pattern))
+        for img_folder in img_data_folders:
+            # Look for files matching the band pattern
+            band_files = list(img_folder.glob(f"*{band}*.jp2"))
             if band_files:
                 return band_files[0]
         
         return None
     
-    def _load_band(self, band_path: Path, extent: Tuple[float, float, float, float]) -> xr.DataArray:
+    def _load_band(
+        self, 
+        band_file: Path, 
+        extent: Tuple[float, float, float, float]
+    ) -> xr.DataArray:
         """
-        Load single band with spatial cropping.
+        Load a single band file.
         
         Parameters
         ----------
-        band_path : Path
+        band_file : Path
             Path to band file
         extent : tuple
-            Spatial extent for cropping
+            Bounding box for cropping
             
         Returns
         -------
         xr.DataArray
             Band data array
         """
-        with rasterio.open(band_path) as src:
-            # Calculate window for cropping
+        with rasterio.open(band_file) as src:
+            # Calculate window for extent
             window = rasterio.windows.from_bounds(
                 extent[0], extent[2], extent[1], extent[3], 
                 src.transform
@@ -217,18 +218,18 @@ class Sentinel2DataHandler:
             data = src.read(1, window=window)
             
             # Get transform for windowed data
-            transform = rasterio.windows.transform(window, src.transform)
+            transform = src.window_transform(window)
             
-            # Create coordinate arrays
+            # Create coordinates
             height, width = data.shape
             x_coords = np.linspace(
-                transform[2], 
-                transform[2] + width * transform[0], 
+                transform.c, 
+                transform.c + width * transform.a, 
                 width
             )
             y_coords = np.linspace(
-                transform[5], 
-                transform[5] + height * transform[4], 
+                transform.f, 
+                transform.f + height * transform.e, 
                 height
             )
             
@@ -238,14 +239,14 @@ class Sentinel2DataHandler:
                 dims=['y', 'x'],
                 coords={'y': y_coords, 'x': x_coords},
                 attrs={
-                    'crs': src.crs.to_string(),
+                    'crs': src.crs,
                     'transform': transform,
                     'nodata': src.nodata
                 }
             )
             
-            # Apply scale factor (Sentinel-2 L2A scale factor is 10000)
-            da = da / 10000.0
+            # Convert to reflectance (Sentinel-2 L2A is already in reflectance * 10000)
+            da = da.astype(np.float32) / 10000.0
             
             # Mask invalid values
             if src.nodata is not None:
@@ -255,7 +256,7 @@ class Sentinel2DataHandler:
     
     def get_observation_geometry(
         self, 
-        target_date: datetime, 
+        target_date: datetime,
         extent: Tuple[float, float, float, float]
     ) -> Dict[str, xr.DataArray]:
         """
@@ -266,315 +267,277 @@ class Sentinel2DataHandler:
         target_date : datetime
             Target acquisition date
         extent : tuple
-            Spatial extent
+            Bounding box for processing
             
         Returns
         -------
         dict
             Dictionary containing geometry arrays
         """
-        # Find product directory
-        product_dir = self.find_product_directory(target_date)
-        if product_dir is None:
+        self.logger.info("Extracting Sentinel-2 observation geometry")
+        
+        # Find product folder
+        product_folder = self.find_product_folder(target_date)
+        if not product_folder:
             raise FileNotFoundError(f"No Sentinel-2 product found for {target_date}")
         
-        # Find metadata file
-        metadata_file = self._find_metadata_file(product_dir)
-        if metadata_file is None:
-            raise FileNotFoundError("Metadata file not found")
+        # Find MTD_TL.xml file
+        mtd_file = self._find_metadata_file(product_folder)
         
-        self.logger.info(f"Extracting geometry from {metadata_file}")
+        # Parse geometry from XML
+        geometry_data = self._parse_geometry_from_xml(mtd_file, extent)
         
-        # Parse metadata
-        geometry = self._parse_geometry_metadata(metadata_file, extent)
-        
-        return geometry
+        return geometry_data
     
-    def _find_metadata_file(self, product_dir: Path) -> Optional[Path]:
+    def _find_metadata_file(self, product_folder: Path) -> Path:
         """
-        Find tile-level metadata file.
+        Find the metadata XML file.
         
         Parameters
         ----------
-        product_dir : Path
-            Product directory
+        product_folder : Path
+            Sentinel-2 product folder
             
         Returns
         -------
-        Path or None
-            Path to metadata file
+        Path
+            Path to MTD_TL.xml file
         """
-        # Look for MTD_TL.xml in granule directory
-        mtd_files = list(product_dir.glob("GRANULE/*/MTD_TL.xml"))
+        # Try different locations
+        possible_locations = [
+            product_folder / "MTD_TL.xml",
+            product_folder / "GRANULE" / "*" / "MTD_TL.xml"
+        ]
         
-        if mtd_files:
-            return mtd_files[0]
+        for location in possible_locations:
+            if '*' in str(location):
+                # Handle wildcard
+                matches = list(product_folder.glob(str(location).replace(str(product_folder) + "/", "")))
+                if matches:
+                    return matches[0]
+            elif location.exists():
+                return location
         
-        # Fallback to main metadata file
-        main_mtd = list(product_dir.glob("MTD_*.xml"))
-        if main_mtd:
-            return main_mtd[0]
-        
-        return None
+        raise FileNotFoundError(f"MTD_TL.xml not found in {product_folder}")
     
-    def _parse_geometry_metadata(self, metadata_file: Path, extent: Tuple[float, float, float, float]) -> Dict[str, xr.DataArray]:
+    def _parse_geometry_from_xml(
+        self, 
+        mtd_file: Path,
+        extent: Tuple[float, float, float, float]
+    ) -> Dict[str, xr.DataArray]:
         """
-        Parse geometry information from metadata XML.
+        Parse observation geometry from MTD_TL.xml file.
         
         Parameters
         ----------
-        metadata_file : Path
-            Path to metadata file
+        mtd_file : Path
+            Path to MTD_TL.xml file
         extent : tuple
-            Target spatial extent
+            Bounding box for geometry grid
             
         Returns
         -------
         dict
             Dictionary containing geometry arrays
         """
-        try:
-            tree = ET.parse(metadata_file)
-            root = tree.getroot()
+        tree = ET.parse(mtd_file)
+        root = tree.getroot()
+        
+        # Extract sun angles
+        sun_zenith_grid = self._extract_angle_grid(root, 'Sun_Angles_Grid/Zenith')
+        sun_azimuth_grid = self._extract_angle_grid(root, 'Sun_Angles_Grid/Azimuth')
+        
+        # Extract viewing angles (averaged across detectors)
+        view_zenith_grid = self._extract_viewing_angles(root, 'Zenith')
+        view_azimuth_grid = self._extract_viewing_angles(root, 'Azimuth')
+        
+        # Convert to DataArrays and interpolate to target extent
+        geometry_arrays = {}
+        
+        for name, grid_data in [
+            ('solar_zenith', sun_zenith_grid),
+            ('solar_azimuth', sun_azimuth_grid),
+            ('view_zenith', view_zenith_grid),
+            ('view_azimuth', view_azimuth_grid)
+        ]:
+            # Create DataArray from grid (typically 23x23)
+            da = xr.DataArray(
+                grid_data,
+                dims=['y', 'x']
+            )
             
-            # Extract sun angles
-            sun_angles = self._extract_sun_angles(root, extent)
+            # Interpolate to target extent
+            # This is a simplified approach - in practice, you'd need to
+            # properly georeference the angle grids
+            da_interp = self._interpolate_to_extent(da, extent)
             
-            # Extract viewing angles
-            view_angles = self._extract_viewing_angles(root, extent)
-            
-            # Combine geometry
-            geometry = {
-                'theta_s': sun_angles['zenith'],
-                'phi_s': sun_angles['azimuth'],
-                'theta_v': view_angles['zenith'],
-                'phi_v': view_angles['azimuth'],
-                'date_str': metadata_file.parent.parent.name.split('_')[2]
-            }
-            
-            # Compute relative azimuth
-            phi_rel = np.abs(geometry['phi_s'] - geometry['phi_v'])
-            phi_rel = np.where(phi_rel > 180, 360 - phi_rel, phi_rel)
-            geometry['phi'] = phi_rel * np.pi / 180.0  # Convert to radians
-            
-            # Convert angles to radians
-            geometry['theta_s'] = geometry['theta_s'] * np.pi / 180.0
-            geometry['theta_v'] = geometry['theta_v'] * np.pi / 180.0
-            
-            return geometry
-            
-        except Exception as e:
-            self.logger.error(f"Error parsing metadata: {e}")
-            raise
+            # Convert to radians
+            geometry_arrays[name] = da_interp * np.pi / 180.0
+        
+        # Compute relative azimuth
+        phi_rel = np.abs(geometry_arrays['solar_azimuth'] - geometry_arrays['view_azimuth'])
+        phi_rel = xr.where(phi_rel > np.pi, 2*np.pi - phi_rel, phi_rel)
+        geometry_arrays['relative_azimuth'] = phi_rel
+        
+        return geometry_arrays
     
-    def _extract_sun_angles(self, root: ET.Element, extent: Tuple[float, float, float, float]) -> Dict[str, xr.DataArray]:
+    def _extract_angle_grid(self, root: ET.Element, xpath: str) -> np.ndarray:
         """
-        Extract sun angles from metadata.
+        Extract angle grid from XML.
         
         Parameters
         ----------
         root : ET.Element
             XML root element
-        extent : tuple
-            Spatial extent
-            
-        Returns
-        -------
-        dict
-            Dictionary containing sun angle arrays
-        """
-        # Find sun angles grid
-        sun_zenith_elem = root.find(".//Sun_Angles_Grid/Zenith/Values_List")
-        sun_azimuth_elem = root.find(".//Sun_Angles_Grid/Azimuth/Values_List")
-        
-        if sun_zenith_elem is None or sun_azimuth_elem is None:
-            raise ValueError("Sun angles not found in metadata")
-        
-        # Parse angle values
-        zenith_values = self._parse_angle_values(sun_zenith_elem.text)
-        azimuth_values = self._parse_angle_values(sun_azimuth_elem.text)
-        
-        # Create coordinate arrays
-        coords = self._create_angle_coordinates(extent, zenith_values.shape)
-        
-        # Create DataArrays
-        sun_zenith = xr.DataArray(
-            zenith_values,
-            dims=['y', 'x'],
-            coords=coords
-        )
-        
-        sun_azimuth = xr.DataArray(
-            azimuth_values,
-            dims=['y', 'x'],
-            coords=coords
-        )
-        
-        return {'zenith': sun_zenith, 'azimuth': sun_azimuth}
-    
-    def _extract_viewing_angles(self, root: ET.Element, extent: Tuple[float, float, float, float]) -> Dict[str, xr.DataArray]:
-        """
-        Extract viewing angles from metadata.
-        
-        Parameters
-        ----------
-        root : ET.Element
-            XML root element
-        extent : tuple
-            Spatial extent
-            
-        Returns
-        -------
-        dict
-            Dictionary containing viewing angle arrays
-        """
-        # Find viewing angles (may have multiple detectors)
-        view_zenith_elems = root.findall(".//Viewing_Incidence_Angles_Grids/Zenith/Values_List")
-        view_azimuth_elems = root.findall(".//Viewing_Incidence_Angles_Grids/Azimuth/Values_List")
-        
-        if not view_zenith_elems or not view_azimuth_elems:
-            raise ValueError("Viewing angles not found in metadata")
-        
-        # Average across all detectors
-        zenith_arrays = []
-        azimuth_arrays = []
-        
-        for elem in view_zenith_elems:
-            zenith_values = self._parse_angle_values(elem.text)
-            zenith_arrays.append(zenith_values)
-        
-        for elem in view_azimuth_elems:
-            azimuth_values = self._parse_angle_values(elem.text)
-            azimuth_arrays.append(azimuth_values)
-        
-        # Compute mean across detectors
-        mean_zenith = np.nanmean(np.stack(zenith_arrays), axis=0)
-        mean_azimuth = np.nanmean(np.stack(azimuth_arrays), axis=0)
-        
-        # Create coordinate arrays
-        coords = self._create_angle_coordinates(extent, mean_zenith.shape)
-        
-        # Create DataArrays
-        view_zenith = xr.DataArray(
-            mean_zenith,
-            dims=['y', 'x'],
-            coords=coords
-        )
-        
-        view_azimuth = xr.DataArray(
-            mean_azimuth,
-            dims=['y', 'x'],
-            coords=coords
-        )
-        
-        return {'zenith': view_zenith, 'azimuth': view_azimuth}
-    
-    def _parse_angle_values(self, text: str) -> np.ndarray:
-        """
-        Parse angle values from XML text.
-        
-        Parameters
-        ----------
-        text : str
-            XML text containing angle values
+        xpath : str
+            XPath to angle values
             
         Returns
         -------
         np.ndarray
-            2D array of angle values
+            Angle grid as 2D array
         """
-        # Split text into lines and then into values
-        lines = text.strip().split('\n')
-        values = []
+        # Find the Values_List element
+        values_element = root.find(f".//{xpath}/Values_List")
         
-        for line in lines:
-            line_values = [float(x) for x in line.strip().split()]
-            values.append(line_values)
+        if values_element is None:
+            raise ValueError(f"Could not find {xpath} in XML")
         
-        return np.array(values)
+        # Extract values
+        values_text = values_element.text.strip()
+        values_lines = values_text.split('\n')
+        
+        # Parse into 2D array
+        grid_data = []
+        for line in values_lines:
+            if line.strip():
+                row_values = [float(x) for x in line.split()]
+                grid_data.append(row_values)
+        
+        return np.array(grid_data)
     
-    def _create_angle_coordinates(self, extent: Tuple[float, float, float, float], shape: Tuple[int, int]) -> Dict[str, np.ndarray]:
+    def _extract_viewing_angles(self, root: ET.Element, angle_type: str) -> np.ndarray:
         """
-        Create coordinate arrays for angle grids.
+        Extract viewing angles, averaging across detectors.
         
         Parameters
         ----------
+        root : ET.Element
+            XML root element
+        angle_type : str
+            'Zenith' or 'Azimuth'
+            
+        Returns
+        -------
+        np.ndarray
+            Averaged viewing angle grid
+        """
+        # Find all viewing angle grids for different bands/detectors
+        viewing_elements = root.findall(f".//Viewing_Incidence_Angles_Grids/{angle_type}/Values_List")
+        
+        if not viewing_elements:
+            raise ValueError(f"Could not find viewing {angle_type} angles in XML")
+        
+        # Extract all grids
+        grids = []
+        for element in viewing_elements:
+            values_text = element.text.strip()
+            values_lines = values_text.split('\n')
+            
+            grid_data = []
+            for line in values_lines:
+                if line.strip():
+                    row_values = [float(x) for x in line.split()]
+                    grid_data.append(row_values)
+            
+            grids.append(np.array(grid_data))
+        
+        # Average across all detectors/bands
+        stacked_grids = np.stack(grids, axis=0)
+        averaged_grid = np.nanmean(stacked_grids, axis=0)
+        
+        return averaged_grid
+    
+    def _interpolate_to_extent(
+        self, 
+        angle_grid: xr.DataArray,
+        extent: Tuple[float, float, float, float],
+        target_resolution: float = 20.0
+    ) -> xr.DataArray:
+        """
+        Interpolate angle grid to target extent and resolution.
+        
+        This is a simplified implementation. In practice, you would need
+        to properly georeference the angle grids using the tile geometry.
+        
+        Parameters
+        ----------
+        angle_grid : xr.DataArray
+            Input angle grid (typically 23x23)
         extent : tuple
-            Spatial extent
-        shape : tuple
-            Array shape (ny, nx)
+            Target extent (xmin, xmax, ymin, ymax)
+        target_resolution : float
+            Target pixel resolution in meters
             
         Returns
         -------
-        dict
-            Dictionary containing coordinate arrays
+        xr.DataArray
+            Interpolated angle grid
         """
-        ny, nx = shape
+        # Calculate target grid dimensions
+        width = int((extent[1] - extent[0]) / target_resolution)
+        height = int((extent[3] - extent[2]) / target_resolution)
         
-        x_coords = np.linspace(extent[0], extent[1], nx)
-        y_coords = np.linspace(extent[3], extent[2], ny)  # Y decreases
+        # Create target coordinates
+        x_coords = np.linspace(extent[0], extent[1], width)
+        y_coords = np.linspace(extent[3], extent[2], height)  # Reverse for image coordinates
         
-        return {'y': y_coords, 'x': x_coords}
+        # Simple interpolation (bilinear)
+        interpolated = angle_grid.interp(
+            x=x_coords,
+            y=y_coords,
+            method='linear'
+        )
+        
+        return interpolated
     
-    def get_band_info(self) -> Dict[str, Dict[str, Union[str, int]]]:
+    def apply_cloud_mask(
+        self, 
+        dataset: xr.Dataset,
+        product_folder: Path
+    ) -> xr.Dataset:
         """
-        Get information about available bands.
-        
-        Returns
-        -------
-        dict
-            Dictionary containing band information
-        """
-        return self.band_mapping.copy()
-    
-    def validate_product(self, product_dir: Path) -> bool:
-        """
-        Validate Sentinel-2 product structure.
+        Apply cloud mask to Sentinel-2 data.
         
         Parameters
         ----------
-        product_dir : Path
-            Product directory to validate
+        dataset : xr.Dataset
+            Sentinel-2 dataset
+        product_folder : Path
+            Path to Sentinel-2 product folder
             
         Returns
         -------
-        bool
-            True if product structure is valid
+        xr.Dataset
+            Cloud-masked dataset
         """
-        try:
-            # Check for required directories
-            required_dirs = ['GRANULE', 'DATASTRIP']
+        # Find cloud mask file (SCL - Scene Classification Layer)
+        scl_file = self._find_band_file(product_folder, 'SCL')
+        
+        if scl_file:
+            self.logger.info("Applying cloud mask")
             
-            for dir_name in required_dirs:
-                if not (product_dir / dir_name).exists():
-                    self.logger.error(f"Missing required directory: {dir_name}")
-                    return False
+            # Load SCL data
+            with rasterio.open(scl_file) as src:
+                scl_data = src.read(1)
+                
+            # Create cloud mask (SCL values: 1=saturated, 3=cloud shadow, 
+            # 8=cloud medium prob, 9=cloud high prob, 10=thin cirrus)
+            cloud_values = [1, 3, 8, 9, 10]
+            cloud_mask = np.isin(scl_data, cloud_values)
             
-            # Check for metadata file
-            if not self._find_metadata_file(product_dir):
-                self.logger.error("Metadata file not found")
-                return False
-            
-            # Check for some band files
-            granule_dirs = list(product_dir.glob("GRANULE/*"))
-            if not granule_dirs:
-                self.logger.error("No granule directories found")
-                return False
-            
-            img_data_dir = granule_dirs[0] / "IMG_DATA"
-            if not img_data_dir.exists():
-                self.logger.error("IMG_DATA directory not found")
-                return False
-            
-            # Check for at least one band file
-            band_files = list(img_data_dir.rglob("*.jp2"))
-            if not band_files:
-                self.logger.error("No band files found")
-                return False
-            
-            self.logger.info(f"Product validation successful: {product_dir}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error validating product: {e}")
-            return False
+            # Apply mask to all bands
+            for var in dataset.data_vars:
+                dataset[var] = dataset[var].where(~cloud_mask)
+        
+        return dataset

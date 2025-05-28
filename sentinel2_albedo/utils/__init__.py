@@ -1,10 +1,11 @@
 """
-Utility modules for data processing and analysis.
+Utility modules for Sentinel-2 albedo processing.
 
 This package contains utility functions for:
 - Input/output operations
 - Surface classification and clustering
 - Quality assessment and validation
+- Data visualization
 """
 
 from . import io, clustering, validation
