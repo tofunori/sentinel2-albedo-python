@@ -5,7 +5,7 @@ This package contains utility functions for:
 - Input/output operations
 - Surface classification and clustering
 - Quality assessment and validation
-- Data visualization
+- Data preprocessing helpers
 """
 
 from . import io, clustering, validation

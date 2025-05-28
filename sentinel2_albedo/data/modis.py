@@ -2,123 +2,311 @@
 MODIS data handling and processing.
 
 This module provides functionality for loading and processing MODIS MOD09GA
-data, including time series management, quality assessment, and geometric
-information extraction.
+daily surface reflectance data, including time series management and
+geometry extraction.
 
 Original R implementation by Andre Bertoncini
 Python port by Claude AI Assistant
 """
 
 import logging
+from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import rasterio
 import xarray as xr
-from rasterio.crs import CRS
-from rasterio.warp import reproject, Resampling
+from ..utils.io import load_raster
 
 
 class MODISDataHandler:
     """
-    Handler for MODIS MOD09GA data loading and processing.
+    Handler for MODIS MOD09GA daily surface reflectance data.
     
-    This class provides methods to load MODIS daily surface reflectance data,
-    create time series, extract geometric information, and apply quality filtering.
-    
-    Parameters
-    ----------
-    data_path : Path, optional
-        Base path to MODIS data directories
+    This class provides methods to load MODIS data, manage time series,
+    and extract observation geometry information.
     """
     
-    def __init__(self, data_path: Optional[Path] = None):
-        self.data_path = Path(data_path) if data_path else None
-        self.logger = logging.getLogger(__name__)
-        
-        # MODIS MOD09GA band mapping
-        self.band_mapping = {
-            1: {'name': 'Red', 'wavelength': 645, 'sds_name': 'sur_refl_b01'},
-            2: {'name': 'NIR', 'wavelength': 858, 'sds_name': 'sur_refl_b02'},
-            3: {'name': 'Blue', 'wavelength': 469, 'sds_name': 'sur_refl_b03'},
-            4: {'name': 'Green', 'wavelength': 555, 'sds_name': 'sur_refl_b04'},
-            5: {'name': 'NIR_1240', 'wavelength': 1240, 'sds_name': 'sur_refl_b05'},
-            6: {'name': 'SWIR1', 'wavelength': 1640, 'sds_name': 'sur_refl_b06'},
-            7: {'name': 'SWIR2', 'wavelength': 2130, 'sds_name': 'sur_refl_b07'}
-        }
-        
-        # Quality flags
-        self.qa_band = 'QC_500m'
-        
-        # Scale factors
-        self.reflectance_scale = 0.0001
-        self.angle_scale = 0.01
-        
-        # Fill values
-        self.reflectance_fill = -28672
-        self.angle_fill = -32767
-    
-    def find_modis_files(
-        self, 
-        start_date: datetime, 
-        end_date: datetime,
-        tile: Optional[str] = None
-    ) -> List[Path]:
+    def __init__(self, modis_data_path: Optional[Path] = None):
         """
-        Find MODIS files within date range.
+        Initialize MODIS data handler.
         
         Parameters
         ----------
-        start_date : datetime
-            Start date for search
-        end_date : datetime
-            End date for search
-        tile : str, optional
-            MODIS tile identifier (e.g., 'h10v03')
+        modis_data_path : Path, optional
+            Path to MODIS data directory
+        """
+        self.data_path = Path(modis_data_path) if modis_data_path else None
+        self.logger = logging.getLogger(__name__)
+        
+        # MODIS band mapping (MOD09GA)
+        self.band_mapping = {
+            1: 'red',        # Band 1: Red (620-670 nm)
+            2: 'nir',        # Band 2: NIR (841-876 nm)
+            3: 'blue',       # Band 3: Blue (459-479 nm)
+            4: 'green',      # Band 4: Green (545-565 nm)
+            5: 'nir_wide',   # Band 5: NIR (1230-1250 nm)
+            6: 'swir1',      # Band 6: SWIR1 (1628-1652 nm)
+            7: 'swir2'       # Band 7: SWIR2 (2105-2155 nm)
+        }
+        
+        # File patterns for different data types
+        self.file_patterns = {
+            'surface_reflectance': 'MOD09GA*.sur_refl_b{:02d}*.tif',
+            'view_zenith': 'MOD09GA*.view_zenith*.tif',
+            'view_azimuth': 'MOD09GA*.view_azimuth*.tif',
+            'solar_zenith': 'MOD09GA*.solar_zenith*.tif',
+            'solar_azimuth': 'MOD09GA*.solar_azimuth*.tif',
+            'qa_500m': 'MOD09GA*.QC_500m*.tif'
+        }
+    
+    def find_modis_files(
+        self, 
+        date: datetime, 
+        data_type: str = 'surface_reflectance',
+        band: Optional[int] = None
+    ) -> List[Path]:
+        """
+        Find MODIS files for a specific date and data type.
+        
+        Parameters
+        ----------
+        date : datetime
+            Target date
+        data_type : str, optional
+            Type of data to find
+        band : int, optional
+            Specific band number (for surface reflectance)
             
         Returns
         -------
         list
-            List of MODIS file paths
+            List of matching file paths
         """
-        if self.data_path is None:
-            raise ValueError("Data path not set")
+        if not self.data_path or not self.data_path.exists():
+            raise ValueError("MODIS data path not set or doesn't exist")
         
-        files = []
-        current_date = start_date
+        # Convert date to day of year
+        day_of_year = date.timetuple().tm_yday
+        year = date.year
+        date_pattern = f"{year}{day_of_year:03d}"
         
-        while current_date <= end_date:
-            # Generate expected filename pattern
-            year = current_date.year
-            doy = current_date.timetuple().tm_yday
-            
-            pattern = f"MOD09GA.A{year}{doy:03d}*.hdf"
-            if tile:
-                pattern = f"MOD09GA.A{year}{doy:03d}.{tile}.*.hdf"
-            
-            # Search for files matching pattern
-            matching_files = list(self.data_path.glob(pattern))
-            files.extend(matching_files)
-            
-            current_date += timedelta(days=1)
+        # Get file pattern
+        if data_type == 'surface_reflectance' and band is not None:
+            pattern = self.file_patterns[data_type].format(band)
+        else:
+            pattern = self.file_patterns.get(data_type, f"MOD09GA*.{data_type}*.tif")
         
-        files.sort()
-        self.logger.info(f"Found {len(files)} MODIS files between {start_date} and {end_date}")
+        # Search for files
+        matching_files = []
         
-        return files
+        for file_path in self.data_path.rglob(pattern):
+            if date_pattern in file_path.name:
+                matching_files.append(file_path)
+        
+        return sorted(matching_files)
     
     def load_timeseries(
         self,
         start_date: datetime,
         end_date: datetime,
-        band: Union[int, List[int]],
-        extent: Tuple[float, float, float, float],
-        tile: Optional[str] = None
+        band: int,
+        extent: Tuple[float, float, float, float]
     ) -> xr.Dataset:
         """
-        Load MODIS time series data.
+        Load MODIS time series for a specific band and date range.
+        
+        Parameters
+        ----------
+        start_date : datetime
+            Start date of time series
+        end_date : datetime
+            End date of time series
+        band : int
+            MODIS band number
+        extent : tuple
+            Spatial extent (xmin, xmax, ymin, ymax)
+            
+        Returns
+        -------
+        xr.Dataset
+            Time series dataset
+        """
+        self.logger.info(f"Loading MODIS time series for band {band}...")
+        
+        # Generate date range
+        date_range = []
+        current_date = start_date
+        
+        while current_date <= end_date:
+            date_range.append(current_date)
+            current_date += timedelta(days=1)
+        
+        # Load data for each date
+        time_series_data = {}
+        
+        for date in date_range:
+            try:
+                # Load surface reflectance
+                refl_files = self.find_modis_files(date, 'surface_reflectance', band)
+                
+                if refl_files:
+                    refl_data = load_raster(refl_files[0], extent=extent)
+                    time_series_data[f'sur_refl_b{band:02d}_{date.strftime("%Y%j")}'] = refl_data
+                
+                # Load geometry data
+                geometry_data = self._load_geometry_data(date, extent)
+                
+                for geom_var, geom_data in geometry_data.items():
+                    time_series_data[f'{geom_var}_{date.strftime("%Y%j")}'] = geom_data
+                
+                # Load QA data
+                qa_files = self.find_modis_files(date, 'qa_500m')
+                
+                if qa_files:
+                    qa_data = load_raster(qa_files[0], extent=extent)
+                    time_series_data[f'qa_500m_{date.strftime("%Y%j")}'] = qa_data
+                    
+            except Exception as e:
+                self.logger.warning(f"Error loading data for {date}: {e}")
+                continue
+        
+        if not time_series_data:
+            raise ValueError(f"No MODIS data found for band {band} in date range")
+        
+        # Create dataset
+        dataset = xr.Dataset(time_series_data)
+        
+        # Add metadata
+        dataset.attrs.update({
+            'band': band,
+            'start_date': start_date.isoformat(),
+            'end_date': end_date.isoformat(),
+            'extent': extent,
+            'n_dates': len(date_range)
+        })
+        
+        return dataset
+    
+    def _load_geometry_data(
+        self, 
+        date: datetime, 
+        extent: Tuple[float, float, float, float]
+    ) -> Dict[str, xr.DataArray]:
+        """
+        Load geometry data for a specific date.
+        
+        Parameters
+        ----------
+        date : datetime
+            Target date
+        extent : tuple
+            Spatial extent
+            
+        Returns
+        -------
+        dict
+            Dictionary containing geometry data
+        """
+        geometry_data = {}
+        
+        geometry_types = ['view_zenith', 'view_azimuth', 'solar_zenith', 'solar_azimuth']
+        
+        for geom_type in geometry_types:
+            try:
+                geom_files = self.find_modis_files(date, geom_type)
+                
+                if geom_files:
+                    geom_data = load_raster(geom_files[0], extent=extent)
+                    geometry_data[geom_type] = geom_data
+                    
+            except Exception as e:
+                self.logger.warning(f"Error loading {geom_type} for {date}: {e}")
+        
+        return geometry_data
+    
+    def load_single_date(
+        self,
+        date: datetime,
+        bands: List[int],
+        extent: Tuple[float, float, float, float],
+        include_geometry: bool = True,
+        include_qa: bool = True
+    ) -> xr.Dataset:
+        """
+        Load MODIS data for a single date.
+        
+        Parameters
+        ----------
+        date : datetime
+            Target date
+        bands : list
+            List of band numbers to load
+        extent : tuple
+            Spatial extent
+        include_geometry : bool, optional
+            Whether to include geometry data
+        include_qa : bool, optional
+            Whether to include QA data
+            
+        Returns
+        -------
+        xr.Dataset
+            MODIS dataset for the date
+        """
+        data_vars = {}
+        
+        # Load surface reflectance bands
+        for band in bands:
+            try:
+                refl_files = self.find_modis_files(date, 'surface_reflectance', band)
+                
+                if refl_files:
+                    refl_data = load_raster(refl_files[0], extent=extent)
+                    band_name = f'sur_refl_b{band:02d}'
+                    data_vars[band_name] = refl_data
+                else:
+                    self.logger.warning(f"No surface reflectance file found for band {band} on {date}")
+                    
+            except Exception as e:
+                self.logger.error(f"Error loading band {band} for {date}: {e}")
+        
+        # Load geometry data
+        if include_geometry:
+            geometry_data = self._load_geometry_data(date, extent)
+            data_vars.update(geometry_data)
+        
+        # Load QA data
+        if include_qa:
+            try:
+                qa_files = self.find_modis_files(date, 'qa_500m')
+                
+                if qa_files:
+                    qa_data = load_raster(qa_files[0], extent=extent)
+                    data_vars['qa_500m'] = qa_data
+                    
+            except Exception as e:
+                self.logger.warning(f"Error loading QA data for {date}: {e}")
+        
+        # Create dataset
+        dataset = xr.Dataset(data_vars)
+        
+        # Add metadata
+        dataset.attrs.update({
+            'date': date.isoformat(),
+            'bands': bands,
+            'extent': extent
+        })
+        
+        return dataset
+    
+    def get_available_dates(
+        self, 
+        start_date: datetime, 
+        end_date: datetime
+    ) -> List[datetime]:
+        """
+        Get list of available dates within a date range.
         
         Parameters
         ----------
@@ -126,420 +314,106 @@ class MODISDataHandler:
             Start date
         end_date : datetime
             End date
-        band : int or list
-            Band number(s) to load
-        extent : tuple
-            Spatial extent as (xmin, xmax, ymin, ymax)
-        tile : str, optional
-            MODIS tile identifier
             
         Returns
         -------
-        xr.Dataset
-            Time series dataset
+        list
+            List of available dates
         """
-        # Find MODIS files
-        files = self.find_modis_files(start_date, end_date, tile)
+        if not self.data_path or not self.data_path.exists():
+            return []
         
-        if not files:
-            raise FileNotFoundError(f"No MODIS files found for date range {start_date} to {end_date}")
+        available_dates = set()
         
-        # Ensure band is a list
-        if isinstance(band, int):
-            bands = [band]
-        else:
-            bands = band
+        # Search for any MODIS files in the date range
+        current_date = start_date
         
-        # Load data from each file
-        datasets = []
+        while current_date <= end_date:
+            day_of_year = current_date.timetuple().tm_yday
+            year = current_date.year
+            date_pattern = f"{year}{day_of_year:03d}"
+            
+            # Check if any files exist for this date
+            matching_files = list(self.data_path.rglob(f"MOD09GA*{date_pattern}*.tif"))
+            
+            if matching_files:
+                available_dates.add(current_date)
+            
+            current_date += timedelta(days=1)
         
-        for file_path in files:
-            try:
-                daily_data = self.load_daily_data(file_path, bands, extent)
-                if daily_data is not None:
-                    datasets.append(daily_data)
-            except Exception as e:
-                self.logger.warning(f"Failed to load {file_path}: {e}")
-                continue
-        
-        if not datasets:
-            raise ValueError("No valid MODIS data could be loaded")
-        
-        # Concatenate along time dimension
-        timeseries = xr.concat(datasets, dim='time')
-        
-        # Add metadata
-        timeseries.attrs['start_date'] = start_date.isoformat()
-        timeseries.attrs['end_date'] = end_date.isoformat()
-        timeseries.attrs['extent'] = extent
-        timeseries.attrs['bands'] = bands
-        
-        return timeseries
+        return sorted(list(available_dates))
     
-    def load_daily_data(
-        self,
-        file_path: Path,
-        bands: List[int],
-        extent: Tuple[float, float, float, float]
-    ) -> Optional[xr.Dataset]:
+    def get_file_info(self, filepath: Path) -> Dict[str, any]:
         """
-        Load daily MODIS data from single file.
+        Extract information from MODIS filename.
         
         Parameters
         ----------
-        file_path : Path
-            Path to MODIS HDF file
-        bands : list
-            List of band numbers to load
-        extent : tuple
-            Spatial extent for cropping
-            
-        Returns
-        -------
-        xr.Dataset or None
-            Daily dataset or None if loading failed
-        """
-        try:
-            # Extract date from filename
-            filename = file_path.name
-            date_str = filename.split('.')[1][1:]  # Remove 'A' prefix
-            date = datetime.strptime(date_str, '%Y%j')
-            
-            data_vars = {}
-            
-            # Load surface reflectance bands
-            for band in bands:
-                if band in self.band_mapping:
-                    sds_name = self.band_mapping[band]['sds_name']
-                    band_data = self._load_sds(file_path, sds_name, extent)
-                    
-                    if band_data is not None:
-                        # Apply scale factor and mask fill values
-                        band_data = band_data.where(band_data != self.reflectance_fill)
-                        band_data = band_data * self.reflectance_scale
-                        data_vars[sds_name] = band_data
-            
-            # Load quality data
-            qa_data = self._load_sds(file_path, self.qa_band, extent)
-            if qa_data is not None:
-                data_vars['qa_500m'] = qa_data
-            
-            # Load geometric data
-            geom_data = self._load_geometry_data(file_path, extent)
-            data_vars.update(geom_data)
-            
-            if not data_vars:
-                return None
-            
-            # Create dataset
-            dataset = xr.Dataset(data_vars)
-            dataset = dataset.expand_dims('time')
-            dataset['time'] = [date]
-            
-            return dataset
-            
-        except Exception as e:
-            self.logger.error(f"Error loading {file_path}: {e}")
-            return None
-    
-    def _load_sds(self, file_path: Path, sds_name: str, extent: Tuple[float, float, float, float]) -> Optional[xr.DataArray]:
-        """
-        Load a specific SDS (Scientific Data Set) from MODIS HDF file.
-        
-        Parameters
-        ----------
-        file_path : Path
-            Path to HDF file
-        sds_name : str
-            Name of the SDS to load
-        extent : tuple
-            Spatial extent for cropping
-            
-        Returns
-        -------
-        xr.DataArray or None
-            Data array or None if loading failed
-        """
-        try:
-            # Open HDF file as rasterio dataset
-            hdf_path = f"HDF4_EOS:EOS_GRID:{file_path}:MODIS_Grid_500m_2D:{sds_name}"
-            
-            with rasterio.open(hdf_path) as src:
-                # Calculate window for spatial cropping
-                window = rasterio.windows.from_bounds(
-                    extent[0], extent[2], extent[1], extent[3],
-                    src.transform
-                )
-                
-                # Read data
-                data = src.read(1, window=window)
-                
-                # Get windowed transform
-                transform = rasterio.windows.transform(window, src.transform)
-                
-                # Create coordinate arrays
-                height, width = data.shape
-                x_coords = np.linspace(
-                    transform[2],
-                    transform[2] + width * transform[0],
-                    width
-                )
-                y_coords = np.linspace(
-                    transform[5],
-                    transform[5] + height * transform[4],
-                    height
-                )
-                
-                # Create DataArray
-                da = xr.DataArray(
-                    data,
-                    dims=['y', 'x'],
-                    coords={'y': y_coords, 'x': x_coords},
-                    attrs={
-                        'crs': src.crs.to_string() if src.crs else None,
-                        'transform': transform,
-                        'sds_name': sds_name
-                    }
-                )
-                
-                return da
-                
-        except Exception as e:
-            self.logger.warning(f"Failed to load SDS {sds_name} from {file_path}: {e}")
-            return None
-    
-    def _load_geometry_data(self, file_path: Path, extent: Tuple[float, float, float, float]) -> Dict[str, xr.DataArray]:
-        """
-        Load geometric data (angles) from MODIS file.
-        
-        Parameters
-        ----------
-        file_path : Path
+        filepath : Path
             Path to MODIS file
-        extent : tuple
-            Spatial extent
             
         Returns
         -------
         dict
-            Dictionary containing geometric data arrays
+            Dictionary containing file information
         """
-        geom_data = {}
+        filename = filepath.name
         
-        # Geometric SDSs to load
-        geom_sds = {
-            'solar_zenith': 'SolarZenith',
-            'solar_azimuth': 'SolarAzimuth',
-            'view_zenith': 'SensorZenith',
-            'view_azimuth': 'SensorAzimuth'
+        # Parse MODIS filename (e.g., MOD09GA.A2018220.h10v03.006.2018222050516.hdf)
+        parts = filename.split('.')
+        
+        info = {
+            'product': parts[0] if len(parts) > 0 else None,
+            'date_str': parts[1] if len(parts) > 1 else None,
+            'tile': parts[2] if len(parts) > 2 else None,
+            'collection': parts[3] if len(parts) > 3 else None,
+            'processing_date': parts[4] if len(parts) > 4 else None,
+            'filepath': filepath
         }
         
-        for var_name, sds_name in geom_sds.items():
+        # Parse date string
+        if info['date_str'] and info['date_str'].startswith('A'):
             try:
-                # Try 1km grid first
-                hdf_path = f"HDF4_EOS:EOS_GRID:{file_path}:MODIS_Grid_1km_2D:{sds_name}"
-                
-                with rasterio.open(hdf_path) as src:
-                    # Read full data (1km resolution)
-                    data = src.read(1)
-                    
-                    # Mask fill values and apply scale
-                    data = np.where(data == self.angle_fill, np.nan, data)
-                    data = data * self.angle_scale
-                    
-                    # Create coordinates
-                    height, width = data.shape
-                    x_coords = np.linspace(
-                        src.bounds.left, src.bounds.right, width
-                    )
-                    y_coords = np.linspace(
-                        src.bounds.top, src.bounds.bottom, height
-                    )
-                    
-                    # Create DataArray
-                    da = xr.DataArray(
-                        data,
-                        dims=['y', 'x'],
-                        coords={'y': y_coords, 'x': x_coords},
-                        attrs={'sds_name': sds_name}
-                    )
-                    
-                    geom_data[var_name] = da
-                    
-            except Exception as e:
-                self.logger.warning(f"Failed to load {sds_name}: {e}")
-                continue
+                year = int(info['date_str'][1:5])
+                day_of_year = int(info['date_str'][5:8])
+                date = datetime(year, 1, 1) + timedelta(days=day_of_year - 1)
+                info['date'] = date
+            except ValueError:
+                info['date'] = None
         
-        return geom_data
+        return info
     
-    def apply_quality_mask(self, dataset: xr.Dataset, cloud_threshold: int = 1) -> xr.Dataset:
+    def create_coverage_mask(
+        self, 
+        dataset: xr.Dataset, 
+        coverage_threshold: float = 0.6
+    ) -> xr.DataArray:
         """
-        Apply quality mask to MODIS data.
+        Create coverage mask based on pixel coverage percentage.
         
         Parameters
         ----------
         dataset : xr.Dataset
             MODIS dataset
-        cloud_threshold : int, optional
-            Cloud state threshold (0=clear, 1=cloudy, 2=mixed)
+        coverage_threshold : float, optional
+            Minimum coverage threshold (0-1)
             
         Returns
         -------
-        xr.Dataset
-            Quality-masked dataset
+        xr.DataArray
+            Coverage mask
         """
-        if 'qa_500m' not in dataset.data_vars:
-            self.logger.warning("Quality data not available, skipping quality filtering")
-            return dataset
+        # This is a placeholder implementation
+        # In practice, would use actual coverage data from MODIS files
         
-        # Extract cloud state from QA (first 2 bits)
-        qa_data = dataset['qa_500m']
-        cloud_state = qa_data & 3  # Extract first 2 bits
+        # For now, create a simple mask based on data availability
+        if 'sur_refl_b01' in dataset.data_vars:
+            reference_data = dataset['sur_refl_b01']
+            coverage_mask = xr.ones_like(reference_data, dtype=bool)
+        else:
+            # Use first available variable
+            var_name = list(dataset.data_vars.keys())[0]
+            reference_data = dataset[var_name]
+            coverage_mask = xr.ones_like(reference_data, dtype=bool)
         
-        # Create quality mask (True = good quality)
-        quality_mask = cloud_state <= cloud_threshold
-        
-        # Apply mask to all surface reflectance variables
-        masked_dataset = dataset.copy()
-        
-        for var_name in dataset.data_vars:
-            if var_name.startswith('sur_refl'):
-                masked_dataset[var_name] = dataset[var_name].where(quality_mask)
-        
-        # Add quality mask as variable
-        masked_dataset['quality_mask'] = quality_mask
-        
-        return masked_dataset
-    
-    def resample_to_target(
-        self,
-        dataset: xr.Dataset,
-        target_grid: xr.DataArray,
-        method: str = 'bilinear'
-    ) -> xr.Dataset:
-        """
-        Resample MODIS data to target grid.
-        
-        Parameters
-        ----------
-        dataset : xr.Dataset
-            MODIS dataset
-        target_grid : xr.DataArray
-            Target grid for resampling
-        method : str, optional
-            Resampling method ('bilinear', 'nearest')
-            
-        Returns
-        -------
-        xr.Dataset
-            Resampled dataset
-        """
-        # Resample each variable
-        resampled_vars = {}
-        
-        for var_name, var_data in dataset.data_vars.items():
-            if 'x' in var_data.dims and 'y' in var_data.dims:
-                # Resample using xarray interpolation
-                resampled_var = var_data.interp(
-                    x=target_grid.x,
-                    y=target_grid.y,
-                    method=method
-                )
-                resampled_vars[var_name] = resampled_var
-            else:
-                # Keep non-spatial variables as-is
-                resampled_vars[var_name] = var_data
-        
-        # Create resampled dataset
-        resampled_dataset = xr.Dataset(resampled_vars)
-        
-        # Copy attributes
-        resampled_dataset.attrs = dataset.attrs.copy()
-        resampled_dataset.attrs['resampled'] = True
-        resampled_dataset.attrs['resampling_method'] = method
-        
-        return resampled_dataset
-    
-    def compute_statistics(self, dataset: xr.Dataset) -> Dict[str, Dict[str, float]]:
-        """
-        Compute statistics for MODIS time series.
-        
-        Parameters
-        ----------
-        dataset : xr.Dataset
-            MODIS time series dataset
-            
-        Returns
-        -------
-        dict
-            Dictionary containing statistics for each variable
-        """
-        stats = {}
-        
-        for var_name, var_data in dataset.data_vars.items():
-            if var_name.startswith('sur_refl'):
-                var_stats = {
-                    'mean': float(var_data.mean().values),
-                    'std': float(var_data.std().values),
-                    'min': float(var_data.min().values),
-                    'max': float(var_data.max().values),
-                    'valid_pixels': int((~np.isnan(var_data)).sum().values),
-                    'total_pixels': int(var_data.size)
-                }
-                
-                # Add temporal statistics if time dimension exists
-                if 'time' in var_data.dims:
-                    var_stats['temporal_coverage'] = int((~np.isnan(var_data)).sum(dim=['x', 'y']).mean().values)
-                
-                stats[var_name] = var_stats
-        
-        return stats
-    
-    def get_band_info(self) -> Dict[int, Dict[str, Union[str, int]]]:
-        """
-        Get information about MODIS bands.
-        
-        Returns
-        -------
-        dict
-            Dictionary containing band information
-        """
-        return self.band_mapping.copy()
-    
-    def validate_file(self, file_path: Path) -> bool:
-        """
-        Validate MODIS file structure and content.
-        
-        Parameters
-        ----------
-        file_path : Path
-            Path to MODIS file
-            
-        Returns
-        -------
-        bool
-            True if file is valid
-        """
-        try:
-            # Check if file exists and is readable
-            if not file_path.exists():
-                return False
-            
-            # Try to open and read basic info
-            test_sds = f"HDF4_EOS:EOS_GRID:{file_path}:MODIS_Grid_500m_2D:sur_refl_b01"
-            
-            with rasterio.open(test_sds) as src:
-                # Check dimensions
-                if src.width <= 0 or src.height <= 0:
-                    return False
-                
-                # Try to read a small sample
-                sample = src.read(1, window=rasterio.windows.Window(0, 0, 10, 10))
-                if sample.size == 0:
-                    return False
-            
-            return True
-            
-        except Exception as e:
-            self.logger.warning(f"File validation failed for {file_path}: {e}")
-            return False
+        return coverage_mask
